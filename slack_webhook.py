@@ -2,97 +2,105 @@ from flask import Flask, request, jsonify
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from googleapiclient.http import MediaFileUpload
-import datetime
 import pytz
+import requests
+import datetime
 import os
 import base64
 import json
-import requests
-import filetype
+import re
+import tempfile
 
 app = Flask(__name__)
 
-# === Google Sheets & Drive Setup ===
+# Google Sheets and Drive Setup
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
+GOOGLE_CREDS_B64 = os.environ.get('GOOGLE_CREDS_B64')
+SHARED_DRIVE_ID = os.environ.get('SHARED_DRIVE_ID')
+INVOICE_FOLDER_ID = os.environ.get('INVOICE_FOLDER_ID')  # optional, can be the same as SHARED_DRIVE_ID
+
+SLACK_BOT_TOKEN = os.environ.get('SLACK_BOT_TOKEN')
+
 RANGE = 'Expenses'
 
 def get_google_creds():
-    GOOGLE_CREDS_B64 = os.environ.get("GOOGLE_CREDS_B64")
-    if GOOGLE_CREDS_B64:
-        creds_json = base64.b64decode(GOOGLE_CREDS_B64).decode('utf-8')
-        creds_info = json.loads(creds_json)
-        return service_account.Credentials.from_service_account_info(
-            creds_info,
-            scopes=[
-                'https://www.googleapis.com/auth/spreadsheets',
-                'https://www.googleapis.com/auth/drive'
-            ]
-        )
-    else:
-        return service_account.Credentials.from_service_account_file(
-            'credentials.json',
-            scopes=[
-                'https://www.googleapis.com/auth/spreadsheets',
-                'https://www.googleapis.com/auth/drive'
-            ]
-        )
+    creds_info = json.loads(base64.b64decode(GOOGLE_CREDS_B64).decode('utf-8'))
+    return service_account.Credentials.from_service_account_info(
+        creds_info,
+        scopes=[
+            'https://www.googleapis.com/auth/spreadsheets',
+            'https://www.googleapis.com/auth/drive'
+        ]
+    )
 
 creds = get_google_creds()
-sheet_service = build('sheets', 'v4', credentials=creds)
-sheet = sheet_service.spreadsheets()
+sheets_service = build('sheets', 'v4', credentials=creds)
+sheet = sheets_service.spreadsheets()
 drive_service = build('drive', 'v3', credentials=creds)
 
-SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
-
-def get_currency_and_amount(text):
-    import re
-    # Try to extract currency and amount (₹, $, etc.)
-    match = re.search(r'([\₹$€])?\s?([0-9]+(?:[.,][0-9]+)?)', text)
+def extract_expense_info(line):
+    # Try to extract amount, currency, description
+    # Example matches: "$200 - lunch", "1500 INR dinner", "19$ Anthropic", "₹220 Chai"
+    match = re.match(r'([₹$€£]?\s?[\d,]+(?:\.\d{1,2})?)\s*([A-Za-z$₹€£]*)\s*[-:]?\s*(.*)', line)
     if match:
-        currency = match.group(1) if match.group(1) else "INR"
-        amount = match.group(2)
+        amount = match.group(1).replace(',', '').replace(' ', '')
+        currency = match.group(2) if match.group(2) else ''
+        description = match.group(3).strip() or line
     else:
-        currency = "INR"
-        amount = ""
-    return currency, amount
+        amount = ''
+        currency = ''
+        description = line
+    # Clean up currency
+    if not currency and amount and amount[0] in '₹$€£':
+        currency = amount[0]
+        amount = amount[1:]
+    return amount.strip(), currency.strip(), description.strip()
 
-def download_slack_file(url, bot_token, filename):
-    headers = {"Authorization": f"Bearer {bot_token}"}
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        raise Exception(f"Slack file download failed: {response.status_code}")
-    temp_path = f"/tmp/{filename}"
-    with open(temp_path, "wb") as f:
-        f.write(response.content)
-    return temp_path
+def upload_file_to_drive(file_url, filename):
+    # Download file from Slack using bot token
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    r = requests.get(file_url, headers=headers)
+    if r.status_code != 200:
+        print("Failed to download file:", r.text)
+        return ""
 
-def upload_file_to_drive(file_path, filename):
-    kind = filetype.guess(file_path)
-    mime_type = kind.mime if kind else 'application/octet-stream'
-    file_metadata = {'name': filename}
-    media = MediaFileUpload(file_path, mimetype=mime_type)
-    drive_file = drive_service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields='id, webViewLink'
-    ).execute()
-    file_id = drive_file.get('id')
-    link = drive_file.get('webViewLink')
-    # Make file public (optional)
-    drive_service.permissions().create(
-        fileId=file_id,
-        body={"role": "reader", "type": "anyone"},
-    ).execute()
-    return link
-
-def format_description(text):
-    # You can make this smarter (e.g., with LLM), here is a simple fallback:
-    return text.split("-", 1)[-1].strip().capitalize()
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(r.content)
+        tmp.flush()
+        mime_type = r.headers.get('Content-Type', 'application/octet-stream')
+        file_metadata = {
+            'name': filename,
+            'driveId': SHARED_DRIVE_ID,
+            'supportsAllDrives': True,
+            'parents': [INVOICE_FOLDER_ID or SHARED_DRIVE_ID]
+        }
+        media = MediaFileUpload(tmp.name, mimetype=mime_type)
+        try:
+            drive_file = drive_service.files().create(
+                body=file_metadata,
+                media_body=media,
+                supportsAllDrives=True,
+                fields='id, webViewLink'
+            ).execute()
+            file_id = drive_file.get('id')
+            link = drive_file.get('webViewLink')
+            # Make public (anyone with link)
+            drive_service.permissions().create(
+                fileId=file_id,
+                body={"role": "reader", "type": "anyone"},
+                supportsAllDrives=True
+            ).execute()
+            return link
+        except Exception as e:
+            print("File upload error:", e)
+            return ""
+        finally:
+            os.unlink(tmp.name)
 
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
-    data = request.json
     print("\n=== POST RECEIVED ===")
+    data = request.json
     print(data)
 
     if data.get("type") == "url_verification":
@@ -103,53 +111,42 @@ def slack_events():
         text = event.get("text", "")
         user = event.get("user", "")
         files = event.get("files", [])
-        ts = event.get("ts")
-        # --- Date and Time ---
-        # Slack ts is in seconds with decimals
-        local_tz = pytz.timezone("Asia/Kolkata")
-        dt = datetime.datetime.fromtimestamp(float(ts), tz=local_tz)
-        date_str = dt.date().isoformat()
-        time_str = dt.strftime('%Y-%m-%d %H:%M:%S')
-        print(f"NEW MESSAGE: {text} from user {user}")
+        timestamp = datetime.datetime.fromtimestamp(
+            float(event.get("ts", datetime.datetime.now().timestamp())),
+            tz=pytz.timezone('Asia/Kolkata')
+        ).strftime('%Y-%m-%d %H:%M:%S')
 
-        # --- Parse expenses from lines ---
+        # Handle multi-line and multi-expense messages
         lines = text.splitlines()
         for line in lines:
             line = line.strip()
             if not line:
                 continue
-            currency, amount = get_currency_and_amount(line)
-            description = format_description(line)
-            invoice_urls = []
+            amount, currency, description = extract_expense_info(line)
 
-            # --- Handle file uploads ---
+            invoice_url = ""
+            # If there's a file, upload it and get the URL
             if files:
-                for file_info in files:
-                    url = file_info.get('url_private_download') or file_info.get('url_private')
-                    filename = file_info.get('name')
-                    try:
-                        temp_file_path = download_slack_file(url, SLACK_BOT_TOKEN, filename)
-                        drive_link = upload_file_to_drive(temp_file_path, filename)
-                        invoice_urls.append(drive_link)
-                        print(f"File uploaded to Drive: {drive_link}")
-                    except Exception as e:
-                        print(f"File upload error: {e}")
+                for file_obj in files:
+                    url = file_obj.get("url_private_download") or file_obj.get("url_private")
+                    fname = file_obj.get("name", "invoice")
+                    invoice_url = upload_file_to_drive(url, fname)
+                    break  # Only one file per line for now
 
-            # --- Append to Google Sheet ---
             values = [
                 [
-                    date_str,
-                    time_str,
+                    datetime.date.today().isoformat(),
+                    timestamp,
                     amount,
-                    currency,
+                    currency or "INR",
                     description,
                     user,
-                    ", ".join(invoice_urls) if invoice_urls else "",
+                    invoice_url,
                     line
                 ]
             ]
             try:
-                result = sheet.values().append(
+                sheet.values().append(
                     spreadsheetId=SPREADSHEET_ID,
                     range=RANGE,
                     valueInputOption='USER_ENTERED',
