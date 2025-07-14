@@ -9,7 +9,7 @@ import json
 import pytz
 import tempfile
 import requests
-import magic  # For MIME type detection
+import filetype  # For MIME type detection
 
 app = Flask(__name__)
 
@@ -90,8 +90,7 @@ def upload_file_to_drive(file_url, filename):
         tmp_path = tmp_file.name
 
     # Detect MIME type
-    mime = magic.Magic(mime=True)
-    mime_type = mime.from_file(tmp_path)
+    mime_type = filetype.guess(tmp_path)
     file_metadata = {'name': filename}
     media = MediaFileUpload(tmp_path, mimetype=mime_type)
     drive_file = drive_service.files().create(
@@ -140,8 +139,7 @@ def slack_events():
                 tmp_file.write(resp.content)
                 tmp_path = tmp_file.name
             # Detect MIME type
-            mime = magic.Magic(mime=True)
-            mime_type = mime.from_file(tmp_path)
+            mime_type = filetype.guess(tmp_path)
             media = MediaFileUpload(tmp_path, mimetype=mime_type)
             file_metadata = {'name': filename}
             drive_file = drive_service.files().create(
