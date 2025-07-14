@@ -1,23 +1,21 @@
 from flask import Flask, request, jsonify
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 from google.oauth2 import service_account
+from googleapiclient.http import MediaFileUpload
 import datetime
+import pytz
 import os
 import base64
 import json
-import pytz
-import tempfile
 import requests
-import filetype  # For MIME type detection
+import filetype
 
 app = Flask(__name__)
 
-# === Google Sheets Setup ===
-SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', 'YOUR_SPREADSHEET_ID')
+# === Google Sheets & Drive Setup ===
+SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
 RANGE = 'Expenses'
 
-# Load Google Service Account Credentials
 def get_google_creds():
     GOOGLE_CREDS_B64 = os.environ.get("GOOGLE_CREDS_B64")
     if GOOGLE_CREDS_B64:
@@ -44,55 +42,35 @@ sheet_service = build('sheets', 'v4', credentials=creds)
 sheet = sheet_service.spreadsheets()
 drive_service = build('drive', 'v3', credentials=creds)
 
-# Set your local timezone
-LOCAL_TIMEZONE = os.environ.get("TIMEZONE", "Asia/Kolkata")
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 
-def get_local_now():
-    utc_now = datetime.datetime.utcnow().replace(tzinfo=pytz.utc)
-    local_tz = pytz.timezone(LOCAL_TIMEZONE)
-    return utc_now.astimezone(local_tz)
-
-def detect_currency_and_amount(text):
-    # Simple detection of amount and currency symbol (₹, $, €, etc.)
+def get_currency_and_amount(text):
     import re
-    match = re.search(r'([₹$€¥]?)(\d+(\.\d{1,2})?)', text)
+    # Try to extract currency and amount (₹, $, etc.)
+    match = re.search(r'([\₹$€])?\s?([0-9]+(?:[.,][0-9]+)?)', text)
     if match:
-        symbol, amount, _ = match.groups()
-        if symbol == '₹':
-            currency = 'INR'
-        elif symbol == '$':
-            currency = 'USD'
-        elif symbol == '€':
-            currency = 'EUR'
-        elif symbol == '¥':
-            currency = 'JPY'
-        else:
-            currency = 'INR'  # Default
-        return amount, currency
-    return "", "INR"
-
-def extract_description(text):
-    # After the amount, whatever is left is description
-    import re
-    parts = re.split(r'([₹$€¥]?\d+(\.\d{1,2})?)', text, maxsplit=1)
-    desc = ""
-    if len(parts) > 2:
-        desc = parts[2].strip(" -:.") or "Expense"
+        currency = match.group(1) if match.group(1) else "INR"
+        amount = match.group(2)
     else:
-        desc = text.strip()
-    return desc
+        currency = "INR"
+        amount = ""
+    return currency, amount
 
-def upload_file_to_drive(file_url, filename):
-    # Download the file to a temp file
-    resp = requests.get(file_url)
-    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-        tmp_file.write(resp.content)
-        tmp_path = tmp_file.name
+def download_slack_file(url, bot_token, filename):
+    headers = {"Authorization": f"Bearer {bot_token}"}
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        raise Exception(f"Slack file download failed: {response.status_code}")
+    temp_path = f"/tmp/{filename}"
+    with open(temp_path, "wb") as f:
+        f.write(response.content)
+    return temp_path
 
-    # Detect MIME type
-    mime_type = filetype.guess(tmp_path)
+def upload_file_to_drive(file_path, filename):
+    kind = filetype.guess(file_path)
+    mime_type = kind.mime if kind else 'application/octet-stream'
     file_metadata = {'name': filename}
-    media = MediaFileUpload(tmp_path, mimetype=mime_type)
+    media = MediaFileUpload(file_path, mimetype=mime_type)
     drive_file = drive_service.files().create(
         body=file_metadata,
         media_body=media,
@@ -100,20 +78,23 @@ def upload_file_to_drive(file_url, filename):
     ).execute()
     file_id = drive_file.get('id')
     link = drive_file.get('webViewLink')
-    # Make the file public
+    # Make file public (optional)
     drive_service.permissions().create(
         fileId=file_id,
         body={"role": "reader", "type": "anyone"},
     ).execute()
-    os.unlink(tmp_path)
     return link
+
+def format_description(text):
+    # You can make this smarter (e.g., with LLM), here is a simple fallback:
+    return text.split("-", 1)[-1].strip().capitalize()
 
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
-    print("\n=== POST RECEIVED ===")
-    print(request.json)
-
     data = request.json
+    print("\n=== POST RECEIVED ===")
+    print(data)
+
     if data.get("type") == "url_verification":
         return jsonify({"challenge": data["challenge"]})
 
@@ -122,56 +103,48 @@ def slack_events():
         text = event.get("text", "")
         user = event.get("user", "")
         files = event.get("files", [])
+        ts = event.get("ts")
+        # --- Date and Time ---
+        # Slack ts is in seconds with decimals
+        local_tz = pytz.timezone("Asia/Kolkata")
+        dt = datetime.datetime.fromtimestamp(float(ts), tz=local_tz)
+        date_str = dt.date().isoformat()
+        time_str = dt.strftime('%Y-%m-%d %H:%M:%S')
         print(f"NEW MESSAGE: {text} from user {user}")
 
-        invoice_url = ""
-        if files:
-            # Handle only first file for simplicity, can be looped if needed
-            file_info = files[0]
-            file_url = file_info.get("url_private_download") or file_info.get("url_private")
-            filename = file_info.get("name")
-            # Use SLACK_BOT_TOKEN for authentication in headers
-            slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
-            headers = {"Authorization": f"Bearer {slack_token}"}
-            # Download with auth
-            resp = requests.get(file_url, headers=headers)
-            with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-                tmp_file.write(resp.content)
-                tmp_path = tmp_file.name
-            # Detect MIME type
-            mime_type = filetype.guess(tmp_path)
-            media = MediaFileUpload(tmp_path, mimetype=mime_type)
-            file_metadata = {'name': filename}
-            drive_file = drive_service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields='id, webViewLink'
-            ).execute()
-            file_id = drive_file.get('id')
-            invoice_url = drive_file.get('webViewLink')
-            drive_service.permissions().create(
-                fileId=file_id,
-                body={"role": "reader", "type": "anyone"},
-            ).execute()
-            os.unlink(tmp_path)
-
+        # --- Parse expenses from lines ---
         lines = text.splitlines()
         for line in lines:
             line = line.strip()
             if not line:
                 continue
-            amount, currency = detect_currency_and_amount(line)
-            description = extract_description(line)
-            now = get_local_now()
+            currency, amount = get_currency_and_amount(line)
+            description = format_description(line)
+            invoice_urls = []
+
+            # --- Handle file uploads ---
+            if files:
+                for file_info in files:
+                    url = file_info.get('url_private_download') or file_info.get('url_private')
+                    filename = file_info.get('name')
+                    try:
+                        temp_file_path = download_slack_file(url, SLACK_BOT_TOKEN, filename)
+                        drive_link = upload_file_to_drive(temp_file_path, filename)
+                        invoice_urls.append(drive_link)
+                        print(f"File uploaded to Drive: {drive_link}")
+                    except Exception as e:
+                        print(f"File upload error: {e}")
+
+            # --- Append to Google Sheet ---
             values = [
                 [
-                    now.date().isoformat(),
-                    now.strftime('%Y-%m-%d %H:%M:%S'),
+                    date_str,
+                    time_str,
                     amount,
                     currency,
                     description,
                     user,
-                    invoice_url,
+                    ", ".join(invoice_urls) if invoice_urls else "",
                     line
                 ]
             ]
