@@ -7,7 +7,7 @@ app = Flask(__name__)
 
 SPREADSHEET_ID = os.environ['SPREADSHEET_ID']
 GOOGLE_CREDS_B64 = os.environ['GOOGLE_CREDS_B64']
-SHARED_DRIVE_ID = os.environ['SHARED_DRIVE_ID']
+SHARED_DRIVE_ID = os.environ.get('SHARED_DRIVE_ID')
 SLACK_BOT_TOKEN = os.environ['SLACK_BOT_TOKEN']
 INVOICE_FOLDER_ID = os.environ.get('INVOICE_FOLDER_ID') or SHARED_DRIVE_ID
 RANGE = 'Expenses'
