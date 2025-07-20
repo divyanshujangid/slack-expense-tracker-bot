@@ -1,159 +1,189 @@
 from flask import Flask, request, jsonify
-import datetime, os, re, io, requests
-import dropbox
-from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-
-# === CONFIG ===
-SPREADSHEET_ID = os.environ['SPREADSHEET_ID']
-RANGE = 'Expenses'
-DROPBOX_ACCESS_TOKEN = os.environ['DROPBOX_ACCESS_TOKEN']
-
-SCOPES = [
-    'https://www.googleapis.com/auth/spreadsheets',
-]
+from google.oauth2 import service_account
+import dropbox
+import requests
+import datetime
+import os
+import base64
+import json
+import re
+import tempfile
+import time
+import pytesseract
+from PIL import Image
 
 app = Flask(__name__)
-processed_events = set()
+
+# === Google Sheets Setup ===
+SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
+GOOGLE_CREDS_B64 = os.environ.get('GOOGLE_CREDS_B64')
+DROPBOX_ACCESS_TOKEN = os.environ.get('DROPBOX_ACCESS_TOKEN')
+RANGE = 'Expenses'
 
 def get_google_creds():
-    creds_json = os.environ.get("GOOGLE_CREDS_B64")
-    if not creds_json:
-        raise Exception("GOOGLE_CREDS_B64 not set")
-    import base64, json
-    creds_dict = json.loads(base64.b64decode(creds_json))
-    creds = Credentials.from_authorized_user_info(creds_dict, SCOPES)
-    return creds
+    creds_info = json.loads(base64.b64decode(GOOGLE_CREDS_B64).decode('utf-8'))
+    return service_account.Credentials.from_service_account_info(
+        creds_info,
+        scopes=['https://www.googleapis.com/auth/spreadsheets']
+    )
 
-def get_sheets_service():
-    creds = get_google_creds()
-    return build('sheets', 'v4', credentials=creds)
+creds = get_google_creds()
+sheets_service = build('sheets', 'v4', credentials=creds)
+sheet = sheets_service.spreadsheets()
 
-def extract_amount_currency_desc(text):
-    if not text: return "", "INR", ""
-    match = re.match(r"([₹$€£]?\s?\d+(?:\.\d{1,2})?)\s*([₹$€£]|INR|USD|EUR|GBP)?\s*[-:]?\s*(.*)", text, re.IGNORECASE)
+def extract_expense_info(line):
+    match = re.match(r'([₹$€£]?\s?[\d,]+(?:\.\d{1,2})?)\s*([A-Za-z$₹€£]*)\s*[-:]?\s*(.*)', line)
     if match:
-        amount = match.group(1).replace(" ", "")
-        currency = match.group(2) or ""
-        desc = match.group(3).strip() or text
-        if not currency and amount and amount[0] in "₹$€£":
-            currency = amount[0]
-            amount = amount[1:]
-        if not currency:
-            currency = "INR"
-        return amount, currency, desc
-    return "", "INR", text
+        amount = match.group(1).replace(',', '').replace(' ', '')
+        currency = match.group(2) if match.group(2) else ''
+        description = match.group(3).strip() or line
+    else:
+        amount = ''
+        currency = ''
+        description = line
+    if not currency and amount and amount[0] in '₹$€£':
+        currency = amount[0]
+        amount = amount[1:]
+    if not currency:
+        currency = 'INR'
+    return amount.strip(), currency.strip(), description.strip()
 
 def upload_file_to_dropbox(file_content, filename):
     dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
-    path = f"/{filename}"
+    unique_name = f"{int(time.time())}_{filename}"
+    dropbox_path = f"/{unique_name}"
     try:
-        dbx.files_upload(file_content, path, mute=True, mode=dropbox.files.WriteMode.overwrite)
-        # Try to create a shared link (handle case where it exists)
+        dbx.files_upload(file_content, dropbox_path, mode=dropbox.files.WriteMode("add"))
         try:
-            shared_link = dbx.sharing_create_shared_link_with_settings(path).url
+            link = dbx.sharing_create_shared_link_with_settings(dropbox_path)
+            return link.url
         except dropbox.exceptions.ApiError as e:
-            if (hasattr(e, "error") and hasattr(e.error, "get_path") and
-                hasattr(e.error.get_path(), "is_conflict") and
-                e.error.get_path().is_conflict()):
-                # Already exists, get all links
-                links = dbx.sharing_list_shared_links(path=path).links
+            if hasattr(e.error, 'get_shared_link_already_exists') or 'shared_link_already_exists' in str(e):
+                links = dbx.sharing_list_shared_links(path=dropbox_path).links
                 if links:
-                    shared_link = links[0].url
-                else:
-                    raise
-            else:
-                raise
-        # force raw download link
-        shared_link = shared_link.replace("?dl=0", "?dl=1").replace("?dl=1", "?raw=1")
-        return shared_link
+                    return links[0].url
+            print("Dropbox link creation failed:", e)
+            return None
+    except Exception as ex:
+        print("Dropbox upload failed:", ex)
+        return None
+
+def run_ocr_on_image(content):
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        text = pytesseract.image_to_string(Image.open(tmp_path))
+        os.unlink(tmp_path)
+        return text.strip()
     except Exception as e:
-        print("Dropbox upload failed:", e)
+        print("OCR failed:", e)
         return ""
+
+processed_events = set()
 
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
+    print("\n=== POST RECEIVED ===")
     data = request.json
-    print("=== POST RECEIVED ===")
     print(data)
 
-    # Slack url_verification
-    if data and data.get("type") == "url_verification":
+    if data.get("type") == "url_verification":
         return jsonify({"challenge": data["challenge"]})
 
-    # Slack event_callback
-    if data and data.get("type") == "event_callback":
-        event = data.get("event", {})
+    if data.get("event", {}).get("type") == "message":
+        event = data["event"]
         event_id = event.get('client_msg_id') or event.get('ts') or event.get('event_ts')
         if event_id in processed_events:
-            print("Duplicate event, skipping:", event_id)
+            print(f"Duplicate event, skipping: {event_id}")
             return "", 200
         processed_events.add(event_id)
 
-        text = event.get("text", "")
+        text = event.get("text", "").strip()
         user = event.get("user", "")
-        ts = event.get("ts", "")
         files = event.get("files", [])
+        timestamp = datetime.datetime.fromtimestamp(
+            float(event.get("ts", datetime.datetime.now().timestamp()))
+        ).strftime('%Y-%m-%d %H:%M:%S')
 
-        # Fix timestamp extraction
-        if ts:
-            dt = datetime.datetime.fromtimestamp(float(ts))
-            formatted_ts = dt.strftime('%Y-%m-%d %H:%M:%S')
-            date_str = dt.date().isoformat()
-        else:
-            dt = datetime.datetime.now()
-            formatted_ts = dt.strftime('%Y-%m-%d %H:%M:%S')
-            date_str = dt.date().isoformat()
+        lines = text.splitlines() if text else []
+        if not lines:
+            lines = ["No message"]
 
-        # Allow empty text if files exist
-        if not text and files:
-            text = "No message"
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            amount, currency, description = extract_expense_info(line)
 
-        amount, currency, description = extract_amount_currency_desc(text)
+            if files:
+                for file_obj in files:
+                    url = file_obj.get("url_private_download") or file_obj.get("url_private")
+                    fname = file_obj.get("name", "invoice")
+                    slack_token = os.environ.get("SLACK_BOT_TOKEN")
+                    headers = {"Authorization": f"Bearer {slack_token}"}
+                    r = requests.get(url, headers=headers)
+                    if r.status_code != 200:
+                        print("Failed to download file:", r.text)
+                        continue
 
-        invoice_url = ""
-        if files:
-            slack_file = files[0]
-            url_private = slack_file['url_private']
-            filename = slack_file['name']
-            mimetype = slack_file.get('mimetype', 'application/octet-stream')
-            slack_bot_token = os.environ.get('SLACK_BOT_TOKEN')
-            if not slack_bot_token:
-                print("SLACK_BOT_TOKEN not set in environment!")
+                    file_content = r.content
+                    invoice_url = upload_file_to_dropbox(file_content, fname)
+                    ocr_text = run_ocr_on_image(file_content)
+
+                    values = [
+                        [
+                            datetime.date.today().isoformat(),
+                            timestamp,
+                            amount,
+                            currency or "INR",
+                            description,
+                            user,
+                            invoice_url,
+                            ocr_text or "No OCR text"
+                        ]
+                    ]
+                    try:
+                        sheet.values().append(
+                            spreadsheetId=SPREADSHEET_ID,
+                            range=RANGE,
+                            valueInputOption='USER_ENTERED',
+                            body={'values': values}
+                        ).execute()
+                        print(f"Row appended for file: {fname}")
+                    except Exception as e:
+                        print(f"Error appending row for file '{fname}': {e}")
             else:
-                response = requests.get(url_private, headers={"Authorization": f"Bearer {slack_bot_token}"})
-                if response.status_code == 200:
-                    invoice_url = upload_file_to_dropbox(response.content, filename)
-                else:
-                    print("Failed to download file from Slack:", response.text)
-                    invoice_url = url_private  # fallback to Slack's URL
+                # no files, log text only
+                values = [
+                    [
+                        datetime.date.today().isoformat(),
+                        timestamp,
+                        amount,
+                        currency or "INR",
+                        description,
+                        user,
+                        "",  # no file
+                        ""   # no OCR
+                    ]
+                ]
+                try:
+                    sheet.values().append(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=RANGE,
+                        valueInputOption='USER_ENTERED',
+                        body={'values': values}
+                    ).execute()
+                    print(f"Row appended for text only: {line}")
+                except Exception as e:
+                    print(f"Error appending row for '{line}': {e}")
 
-        # Append row to sheet (even if text is 'No message' and file exists)
-        sheets_service = get_sheets_service()
-        sheet = sheets_service.spreadsheets()
-        values = [[
-            date_str,
-            formatted_ts,
-            amount,
-            currency,
-            description,
-            user,
-            invoice_url,
-            text or "No message"
-        ]]
-        print("Appending to sheet id:", SPREADSHEET_ID)
-        print("Row:", values)
-        try:
-            sheet.values().append(
-                spreadsheetId=SPREADSHEET_ID,
-                range=RANGE,
-                valueInputOption='USER_ENTERED',
-                body={'values': values}
-            ).execute()
-            print("Row appended for:", text)
-        except Exception as e:
-            print("Error appending row:", e)
     return "", 200
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
 
 if __name__ == "__main__":
     print(f"Using Google Sheet ID: {SPREADSHEET_ID}")

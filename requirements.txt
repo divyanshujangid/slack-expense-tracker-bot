@@ -6,3 +6,5 @@ google-auth-oauthlib
 pytz
 requests
 dropbox
+pytesseract
+Pillow
