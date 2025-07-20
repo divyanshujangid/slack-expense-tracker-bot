@@ -1,26 +1,15 @@
 from flask import Flask, request, jsonify
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
-from googleapiclient.http import MediaFileUpload
-import pytz
-import requests
-import datetime
-import os
-import base64
-import json
-import re
-import tempfile
+import os, json, base64, re, tempfile, datetime, pytz, requests
 
 app = Flask(__name__)
 
-# Google Sheets and Drive Setup
-SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
-GOOGLE_CREDS_B64 = os.environ.get('GOOGLE_CREDS_B64')
-SHARED_DRIVE_ID = os.environ.get('SHARED_DRIVE_ID')
-INVOICE_FOLDER_ID = os.environ.get('INVOICE_FOLDER_ID')  # optional, can be the same as SHARED_DRIVE_ID
-
-SLACK_BOT_TOKEN = os.environ.get('SLACK_BOT_TOKEN')
-
+SPREADSHEET_ID = os.environ['SPREADSHEET_ID']
+GOOGLE_CREDS_B64 = os.environ['GOOGLE_CREDS_B64']
+SHARED_DRIVE_ID = os.environ['SHARED_DRIVE_ID']
+SLACK_BOT_TOKEN = os.environ['SLACK_BOT_TOKEN']
+INVOICE_FOLDER_ID = os.environ.get('INVOICE_FOLDER_ID') or SHARED_DRIVE_ID
 RANGE = 'Expenses'
 
 def get_google_creds():
@@ -33,37 +22,31 @@ def get_google_creds():
         ]
     )
 
+# (Build services once per process)
 creds = get_google_creds()
 sheets_service = build('sheets', 'v4', credentials=creds)
 sheet = sheets_service.spreadsheets()
 drive_service = build('drive', 'v3', credentials=creds)
 
-def extract_expense_info(line):
-    # Try to extract amount, currency, description
-    # Example matches: "$200 - lunch", "1500 INR dinner", "19$ Anthropic", "₹220 Chai"
-    match = re.match(r'([₹$€£]?\s?[\d,]+(?:\.\d{1,2})?)\s*([A-Za-z$₹€£]*)\s*[-:]?\s*(.*)', line)
+def extract_expense_info(text):
+    match = re.match(r'([₹$€£]?\s?[\d,]+(?:\.\d{1,2})?)\s*([A-Za-z$₹€£]*)\s*[-:]?\s*(.*)', text)
     if match:
         amount = match.group(1).replace(',', '').replace(' ', '')
         currency = match.group(2) if match.group(2) else ''
-        description = match.group(3).strip() or line
+        description = match.group(3).strip() or text
     else:
-        amount = ''
-        currency = ''
-        description = line
-    # Clean up currency
+        amount, currency, description = '', '', text
     if not currency and amount and amount[0] in '₹$€£':
         currency = amount[0]
         amount = amount[1:]
-    return amount.strip(), currency.strip(), description.strip()
+    return amount, currency or 'INR', description
 
 def upload_file_to_drive(file_url, filename):
-    # Download file from Slack using bot token
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
     r = requests.get(file_url, headers=headers)
     if r.status_code != 200:
         print("Failed to download file:", r.text)
         return ""
-
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp.write(r.content)
         tmp.flush()
@@ -72,7 +55,7 @@ def upload_file_to_drive(file_url, filename):
             'name': filename,
             'driveId': SHARED_DRIVE_ID,
             'supportsAllDrives': True,
-            'parents': [INVOICE_FOLDER_ID or SHARED_DRIVE_ID]
+            'parents': [INVOICE_FOLDER_ID]
         }
         media = MediaFileUpload(tmp.name, mimetype=mime_type)
         try:
@@ -84,7 +67,6 @@ def upload_file_to_drive(file_url, filename):
             ).execute()
             file_id = drive_file.get('id')
             link = drive_file.get('webViewLink')
-            # Make public (anyone with link)
             drive_service.permissions().create(
                 fileId=file_id,
                 body={"role": "reader", "type": "anyone"},
@@ -99,10 +81,7 @@ def upload_file_to_drive(file_url, filename):
 
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
-    print("\n=== POST RECEIVED ===")
     data = request.json
-    print(data)
-
     if data.get("type") == "url_verification":
         return jsonify({"challenge": data["challenge"]})
 
@@ -116,23 +95,19 @@ def slack_events():
             tz=pytz.timezone('Asia/Kolkata')
         ).strftime('%Y-%m-%d %H:%M:%S')
 
-        # Handle multi-line and multi-expense messages
         lines = text.splitlines()
         for line in lines:
             line = line.strip()
             if not line:
                 continue
             amount, currency, description = extract_expense_info(line)
-
             invoice_url = ""
-            # If there's a file, upload it and get the URL
             if files:
                 for file_obj in files:
                     url = file_obj.get("url_private_download") or file_obj.get("url_private")
                     fname = file_obj.get("name", "invoice")
                     invoice_url = upload_file_to_drive(url, fname)
-                    break  # Only one file per line for now
-
+                    break
             values = [
                 [
                     datetime.date.today().isoformat(),
