@@ -1,35 +1,49 @@
-import os
-import base64
-import json
-import datetime
-import pytz
-import requests
-import re
-import tempfile
 from flask import Flask, request, jsonify
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from googleapiclient.http import MediaFileUpload
+import pytz
+import requests
+import datetime
+import os
+import base64
+import json
+import re
+import tempfile
+import time
 
-# === DEBUG: Print all env vars at startup ===
-print("==== ALL ENV VARS KEYS AT START ====")
-for key in os.environ.keys():
-    print(key)
-print("==== /ENV VARS ====")
+app = Flask(__name__)
 
-def get_env(name):
-    val = os.environ.get(name)
-    if not val:
+# Env Variables
+def get_env(name, default=None, required=True):
+    value = os.environ.get(name, default)
+    if required and value is None:
         raise Exception(f"Missing required environment variable: {name}")
-    return val
+    return value
 
 SPREADSHEET_ID = get_env('SPREADSHEET_ID')
 GOOGLE_CREDS_B64 = get_env('GOOGLE_CREDS_B64')
 SHARED_DRIVE_ID = get_env('SHARED_DRIVE_ID')
+INVOICE_FOLDER_ID = os.environ.get('INVOICE_FOLDER_ID', SHARED_DRIVE_ID)
 SLACK_BOT_TOKEN = get_env('SLACK_BOT_TOKEN')
-INVOICE_FOLDER_ID = os.environ.get('INVOICE_FOLDER_ID', SHARED_DRIVE_ID)  # optional
 
 RANGE = 'Expenses'
+
+# Deduplication (in-memory, auto-clears old entries)
+processed_events = {}
+EVENT_TTL = 600  # 10 minutes
+
+def is_duplicate(event):
+    event_id = event.get('client_msg_id') or event.get('ts') or event.get('event_ts')
+    now = time.time()
+    # Clean out old events
+    for k in list(processed_events.keys()):
+        if now - processed_events[k] > EVENT_TTL:
+            del processed_events[k]
+    if event_id in processed_events:
+        return True
+    processed_events[event_id] = now
+    return False
 
 def get_google_creds():
     creds_info = json.loads(base64.b64decode(GOOGLE_CREDS_B64).decode('utf-8'))
@@ -67,7 +81,6 @@ def upload_file_to_drive(file_url, filename):
     if r.status_code != 200:
         print("Failed to download file:", r.text)
         return ""
-
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp.write(r.content)
         tmp.flush()
@@ -100,8 +113,6 @@ def upload_file_to_drive(file_url, filename):
         finally:
             os.unlink(tmp.name)
 
-app = Flask(__name__)
-
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     print("\n=== POST RECEIVED ===")
@@ -113,6 +124,12 @@ def slack_events():
 
     if data.get("event", {}).get("type") == "message":
         event = data["event"]
+
+        # DEDUPLICATION
+        if is_duplicate(event):
+            print(f"Duplicate event, skipping: {event.get('client_msg_id') or event.get('ts')}")
+            return "", 200
+
         text = event.get("text", "")
         user = event.get("user", "")
         files = event.get("files", [])
@@ -127,14 +144,13 @@ def slack_events():
             if not line:
                 continue
             amount, currency, description = extract_expense_info(line)
-
             invoice_url = ""
             if files:
                 for file_obj in files:
                     url = file_obj.get("url_private_download") or file_obj.get("url_private")
                     fname = file_obj.get("name", "invoice")
                     invoice_url = upload_file_to_drive(url, fname)
-                    break
+                    break  # Only one file per line for now
 
             values = [
                 [
@@ -162,4 +178,5 @@ def slack_events():
     return "", 200
 
 if __name__ == "__main__":
+    print(f"Using Google Sheet ID: {SPREADSHEET_ID}")
     app.run(host="0.0.0.0", port=5000)
