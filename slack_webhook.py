@@ -12,15 +12,18 @@ import tempfile
 import time
 import pytesseract
 from PIL import Image
+import pytz
 
 app = Flask(__name__)
 
-# === Google Sheets Setup ===
+# === Environment Setup ===
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
 GOOGLE_CREDS_B64 = os.environ.get('GOOGLE_CREDS_B64')
 DROPBOX_ACCESS_TOKEN = os.environ.get('DROPBOX_ACCESS_TOKEN')
 RANGE = 'Expenses'
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 
+# === Google Sheets Setup ===
 def get_google_creds():
     creds_info = json.loads(base64.b64decode(GOOGLE_CREDS_B64).decode('utf-8'))
     return service_account.Credentials.from_service_account_info(
@@ -32,6 +35,7 @@ creds = get_google_creds()
 sheets_service = build('sheets', 'v4', credentials=creds)
 sheet = sheets_service.spreadsheets()
 
+# === Helpers ===
 def extract_expense_info(line):
     match = re.match(r'([₹$€£]?\s?[\d,]+(?:\.\d{1,2})?)\s*([A-Za-z$₹€£]*)\s*[-:]?\s*(.*)', line)
     if match:
@@ -39,12 +43,9 @@ def extract_expense_info(line):
         currency = match.group(2) if match.group(2) else ''
         description = match.group(3).strip() or line
     else:
-        amount = ''
-        currency = ''
-        description = line
+        amount, currency, description = '', '', line
     if not currency and amount and amount[0] in '₹$€£':
-        currency = amount[0]
-        amount = amount[1:]
+        currency, amount = amount[0], amount[1:]
     if not currency:
         currency = 'INR'
     return amount.strip(), currency.strip(), description.strip()
@@ -79,10 +80,12 @@ def run_ocr_on_image(content):
         return text.strip()
     except Exception as e:
         print("OCR failed:", e)
-        return ""
+        return "OCR failed"
 
+# Deduplication memory
 processed_events = set()
 
+# === Routes ===
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     print("\n=== POST RECEIVED ===")
@@ -103,9 +106,11 @@ def slack_events():
         text = event.get("text", "").strip()
         user = event.get("user", "")
         files = event.get("files", [])
+
+        tz = pytz.timezone('Asia/Kolkata')
         timestamp = datetime.datetime.fromtimestamp(
             float(event.get("ts", datetime.datetime.now().timestamp()))
-        ).strftime('%Y-%m-%d %H:%M:%S')
+        ).astimezone(tz).strftime('%Y-%m-%d %H:%M:%S')
 
         lines = text.splitlines() if text else []
         if not lines:
@@ -121,8 +126,7 @@ def slack_events():
                 for file_obj in files:
                     url = file_obj.get("url_private_download") or file_obj.get("url_private")
                     fname = file_obj.get("name", "invoice")
-                    slack_token = os.environ.get("SLACK_BOT_TOKEN")
-                    headers = {"Authorization": f"Bearer {slack_token}"}
+                    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
                     r = requests.get(url, headers=headers)
                     if r.status_code != 200:
                         print("Failed to download file:", r.text)
@@ -155,7 +159,6 @@ def slack_events():
                     except Exception as e:
                         print(f"Error appending row for file '{fname}': {e}")
             else:
-                # no files, log text only
                 values = [
                     [
                         datetime.date.today().isoformat(),
