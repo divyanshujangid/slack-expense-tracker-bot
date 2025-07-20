@@ -1,26 +1,36 @@
+import os
+import base64
+import json
+import datetime
+import pytz
+import requests
+import re
+import tempfile
 from flask import Flask, request, jsonify
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from googleapiclient.http import MediaFileUpload
-import os, json, base64, re, tempfile, datetime, pytz, requests
 
-app = Flask(__name__)
+# === DEBUG: Print all env vars at startup ===
+print("==== ALL ENV VARS KEYS AT START ====")
+for key in os.environ.keys():
+    print(key)
+print("==== /ENV VARS ====")
 
-# --- Environment variables with safe access and errors ---
-def get_env(name, required=True, default=None):
-    value = os.environ.get(name, default)
-    if required and not value:
+def get_env(name):
+    val = os.environ.get(name)
+    if not val:
         raise Exception(f"Missing required environment variable: {name}")
-    return value
+    return val
 
 SPREADSHEET_ID = get_env('SPREADSHEET_ID')
 GOOGLE_CREDS_B64 = get_env('GOOGLE_CREDS_B64')
+SHARED_DRIVE_ID = get_env('SHARED_DRIVE_ID')
 SLACK_BOT_TOKEN = get_env('SLACK_BOT_TOKEN')
-SHARED_DRIVE_ID = get_env('SHARED_DRIVE_ID', required=False)
-INVOICE_FOLDER_ID = get_env('INVOICE_FOLDER_ID', required=False) or SHARED_DRIVE_ID
+INVOICE_FOLDER_ID = os.environ.get('INVOICE_FOLDER_ID', SHARED_DRIVE_ID)  # optional
+
 RANGE = 'Expenses'
 
-# --- Google Service Account Credentials ---
 def get_google_creds():
     creds_info = json.loads(base64.b64decode(GOOGLE_CREDS_B64).decode('utf-8'))
     return service_account.Credentials.from_service_account_info(
@@ -36,28 +46,28 @@ sheets_service = build('sheets', 'v4', credentials=creds)
 sheet = sheets_service.spreadsheets()
 drive_service = build('drive', 'v3', credentials=creds)
 
-def extract_expense_info(text):
-    match = re.match(r'([₹$€£]?\s?[\d,]+(?:\.\d{1,2})?)\s*([A-Za-z$₹€£]*)\s*[-:]?\s*(.*)', text)
+def extract_expense_info(line):
+    match = re.match(r'([₹$€£]?\s?[\d,]+(?:\.\d{1,2})?)\s*([A-Za-z$₹€£]*)\s*[-:]?\s*(.*)', line)
     if match:
         amount = match.group(1).replace(',', '').replace(' ', '')
         currency = match.group(2) if match.group(2) else ''
-        description = match.group(3).strip() or text
+        description = match.group(3).strip() or line
     else:
-        amount, currency, description = '', '', text
+        amount = ''
+        currency = ''
+        description = line
     if not currency and amount and amount[0] in '₹$€£':
         currency = amount[0]
         amount = amount[1:]
-    return amount, currency or 'INR', description
+    return amount.strip(), currency.strip(), description.strip()
 
 def upload_file_to_drive(file_url, filename):
-    if not SHARED_DRIVE_ID:
-        print("Warning: SHARED_DRIVE_ID is not set. Skipping file upload.")
-        return ""
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
     r = requests.get(file_url, headers=headers)
     if r.status_code != 200:
         print("Failed to download file:", r.text)
         return ""
+
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp.write(r.content)
         tmp.flush()
@@ -66,7 +76,7 @@ def upload_file_to_drive(file_url, filename):
             'name': filename,
             'driveId': SHARED_DRIVE_ID,
             'supportsAllDrives': True,
-            'parents': [INVOICE_FOLDER_ID]
+            'parents': [INVOICE_FOLDER_ID or SHARED_DRIVE_ID]
         }
         media = MediaFileUpload(tmp.name, mimetype=mime_type)
         try:
@@ -90,9 +100,14 @@ def upload_file_to_drive(file_url, filename):
         finally:
             os.unlink(tmp.name)
 
+app = Flask(__name__)
+
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
+    print("\n=== POST RECEIVED ===")
     data = request.json
+    print(data)
+
     if data.get("type") == "url_verification":
         return jsonify({"challenge": data["challenge"]})
 
@@ -112,6 +127,7 @@ def slack_events():
             if not line:
                 continue
             amount, currency, description = extract_expense_info(line)
+
             invoice_url = ""
             if files:
                 for file_obj in files:
@@ -119,6 +135,7 @@ def slack_events():
                     fname = file_obj.get("name", "invoice")
                     invoice_url = upload_file_to_drive(url, fname)
                     break
+
             values = [
                 [
                     datetime.date.today().isoformat(),
