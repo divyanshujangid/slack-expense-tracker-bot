@@ -1,17 +1,26 @@
 from flask import Flask, request, jsonify
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
+from googleapiclient.http import MediaFileUpload
 import os, json, base64, re, tempfile, datetime, pytz, requests
 
 app = Flask(__name__)
 
-SPREADSHEET_ID = os.environ['SPREADSHEET_ID']
-GOOGLE_CREDS_B64 = os.environ['GOOGLE_CREDS_B64']
-SHARED_DRIVE_ID = os.environ.get('SHARED_DRIVE_ID')
-SLACK_BOT_TOKEN = os.environ['SLACK_BOT_TOKEN']
-INVOICE_FOLDER_ID = os.environ.get('INVOICE_FOLDER_ID') or SHARED_DRIVE_ID
+# --- Environment variables with safe access and errors ---
+def get_env(name, required=True, default=None):
+    value = os.environ.get(name, default)
+    if required and not value:
+        raise Exception(f"Missing required environment variable: {name}")
+    return value
+
+SPREADSHEET_ID = get_env('SPREADSHEET_ID')
+GOOGLE_CREDS_B64 = get_env('GOOGLE_CREDS_B64')
+SLACK_BOT_TOKEN = get_env('SLACK_BOT_TOKEN')
+SHARED_DRIVE_ID = get_env('SHARED_DRIVE_ID', required=False)
+INVOICE_FOLDER_ID = get_env('INVOICE_FOLDER_ID', required=False) or SHARED_DRIVE_ID
 RANGE = 'Expenses'
 
+# --- Google Service Account Credentials ---
 def get_google_creds():
     creds_info = json.loads(base64.b64decode(GOOGLE_CREDS_B64).decode('utf-8'))
     return service_account.Credentials.from_service_account_info(
@@ -22,7 +31,6 @@ def get_google_creds():
         ]
     )
 
-# (Build services once per process)
 creds = get_google_creds()
 sheets_service = build('sheets', 'v4', credentials=creds)
 sheet = sheets_service.spreadsheets()
@@ -42,6 +50,9 @@ def extract_expense_info(text):
     return amount, currency or 'INR', description
 
 def upload_file_to_drive(file_url, filename):
+    if not SHARED_DRIVE_ID:
+        print("Warning: SHARED_DRIVE_ID is not set. Skipping file upload.")
+        return ""
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
     r = requests.get(file_url, headers=headers)
     if r.status_code != 200:
