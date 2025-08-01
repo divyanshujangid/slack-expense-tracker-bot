@@ -9,3 +9,5 @@ dropbox
 pytesseract
 Pillow
 gunicorn
+easyocr
+torch
