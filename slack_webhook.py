@@ -89,7 +89,7 @@ def run_ocr_and_extract_info(content):
         keywords = ["invoice", "payment", "amount", "bill", "total", "tax", "due", "receipt", "apple", "amazon"]
         desc_line = next((line for line in lines if any(k.lower() in line.lower() for k in keywords)), None)
 
-        description = desc_line or "Could not detect description"
+        description = desc_line or "No description"
         currency = amount[0] if amount and amount[0] in '₹$€£' else ''
         if currency:
             amount = amount[1:]
@@ -97,7 +97,7 @@ def run_ocr_and_extract_info(content):
         return amount.strip(), currency.strip(), description.strip(), text
     except Exception as e:
         print("[OCR ERROR]", e)
-        return "", "", "OCR failed", ""
+        return "", "", "No description", ""  # Clean fallback
 
 # Deduplication memory
 processed_events = set()
