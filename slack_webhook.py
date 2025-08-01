@@ -10,9 +10,8 @@ import json
 import re
 import tempfile
 import time
-import pytesseract
-from PIL import Image
 import pytz
+import easyocr
 
 app = Flask(__name__)
 
@@ -70,26 +69,35 @@ def upload_file_to_dropbox(file_content, filename):
         print("Dropbox upload failed:", ex)
         return None
 
-def run_ocr_on_image(content):
+def run_ocr_and_extract_info(content):
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
             tmp.write(content)
             tmp_path = tmp.name
 
-        print(f"[OCR DEBUG] Temp file created: {tmp_path}")
-        print(f"[OCR DEBUG] File size: {os.path.getsize(tmp_path)} bytes")
+        reader = easyocr.Reader(['en'], gpu=False)
+        lines = reader.readtext(tmp_path, detail=0)
+        text = "\n".join(lines)
 
-        # Ensure correct path for production
-        pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
-
-        text = pytesseract.image_to_string(Image.open(tmp_path))
         os.unlink(tmp_path)
 
-        print("[OCR DEBUG] OCR text extracted:", text[:100])
-        return text.strip() or "No OCR text"
+        # Extract amount using regex
+        amount_match = re.search(r'([₹$€£]?\s?\d{2,7}(?:\.\d{1,2})?)', text)
+        amount = amount_match.group(1).replace(' ', '') if amount_match else ""
+
+        # Try to extract a likely description
+        keywords = ["invoice", "payment", "amount", "bill", "total", "tax", "due", "receipt", "apple", "amazon"]
+        desc_line = next((line for line in lines if any(k.lower() in line.lower() for k in keywords)), None)
+
+        description = desc_line or "Could not detect description"
+        currency = amount[0] if amount and amount[0] in '₹$€£' else ''
+        if currency:
+            amount = amount[1:]
+
+        return amount.strip(), currency.strip(), description.strip(), text
     except Exception as e:
         print("[OCR ERROR]", e)
-        return "OCR failed"
+        return "", "", "OCR failed", ""
 
 # Deduplication memory
 processed_events = set()
@@ -122,14 +130,13 @@ def slack_events():
         ).astimezone(tz).strftime('%Y-%m-%d %H:%M:%S')
 
         lines = text.splitlines() if text else []
-        if not lines:
-            lines = ["No message"]
 
-        for line in lines:
+        for line in (lines or [""]):
             line = line.strip()
-            if not line:
-                continue
-            amount, currency, description = extract_expense_info(line)
+
+            amount, currency, description = "", "", line or "No message"
+            ocr_text = ""
+            invoice_url = ""
 
             if files:
                 for file_obj in files:
@@ -143,18 +150,22 @@ def slack_events():
 
                     file_content = r.content
                     invoice_url = upload_file_to_dropbox(file_content, fname)
-                    ocr_text = run_ocr_on_image(file_content)
+
+                    if not text:  # if no message text, extract from OCR
+                        amount, currency, description, ocr_text = run_ocr_and_extract_info(file_content)
+                    else:
+                        ocr_text = "OCR skipped (text provided)"
 
                     values = [
                         [
                             datetime.date.today().isoformat(),
                             timestamp,
-                            amount,
+                            amount or "Not found",
                             currency or "INR",
-                            description,
+                            description or "No description",
                             user,
                             invoice_url,
-                            ocr_text
+                            ocr_text or "No OCR text"
                         ]
                     ]
                     try:
