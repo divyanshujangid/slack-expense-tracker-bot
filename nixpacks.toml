@@ -1,7 +1,8 @@
 [phases.setup]
 nixPkgs = [
+  "python311",
   "tesseract"
 ]
 
 [start]
-cmd = "python slack_webhook.py"
+cmd = "python3 slack_webhook.py"
