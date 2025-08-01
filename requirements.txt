@@ -1,13 +1,10 @@
 Flask
 google-api-python-client
 google-auth
-google-auth-httplib2
 google-auth-oauthlib
-pytz
-requests
+google-auth-httplib2
 dropbox
+requests
 pytesseract
 Pillow
-gunicorn
-easyocr
-torch
+python-dotenv

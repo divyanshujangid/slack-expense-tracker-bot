@@ -11,7 +11,9 @@ import re
 import tempfile
 import time
 import pytz
-import easyocr
+import pytesseract
+from PIL import Image
+from io import BytesIO
 
 app = Flask(__name__)
 
@@ -71,15 +73,8 @@ def upload_file_to_dropbox(file_content, filename):
 
 def run_ocr_and_extract_info(content):
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-
-        reader = easyocr.Reader(['en'], gpu=False)
-        lines = reader.readtext(tmp_path, detail=0)
-        text = "\n".join(lines)
-
-        os.unlink(tmp_path)
+        image = Image.open(BytesIO(content)).convert("RGB")
+        text = pytesseract.image_to_string(image)
 
         # Extract amount using regex
         amount_match = re.search(r'([₹$€£]?\s?\d{2,7}(?:\.\d{1,2})?)', text)
@@ -87,6 +82,7 @@ def run_ocr_and_extract_info(content):
 
         # Try to extract a likely description
         keywords = ["invoice", "payment", "amount", "bill", "total", "tax", "due", "receipt", "apple", "amazon"]
+        lines = text.splitlines()
         desc_line = next((line for line in lines if any(k.lower() in line.lower() for k in keywords)), None)
 
         description = desc_line or "No description"
@@ -97,7 +93,7 @@ def run_ocr_and_extract_info(content):
         return amount.strip(), currency.strip(), description.strip(), text
     except Exception as e:
         print("[OCR ERROR]", e)
-        return "", "", "No description", ""  # Clean fallback
+        return "", "", "No description", ""
 
 # Deduplication memory
 processed_events = set()
