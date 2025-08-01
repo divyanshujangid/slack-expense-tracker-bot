@@ -75,11 +75,20 @@ def run_ocr_on_image(content):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
             tmp.write(content)
             tmp_path = tmp.name
+
+        print(f"[OCR DEBUG] Temp file created: {tmp_path}")
+        print(f"[OCR DEBUG] File size: {os.path.getsize(tmp_path)} bytes")
+
+        # Ensure correct path for production
+        pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+
         text = pytesseract.image_to_string(Image.open(tmp_path))
         os.unlink(tmp_path)
-        return text.strip()
+
+        print("[OCR DEBUG] OCR text extracted:", text[:100])
+        return text.strip() or "No OCR text"
     except Exception as e:
-        print("OCR failed:", e)
+        print("[OCR ERROR]", e)
         return "OCR failed"
 
 # Deduplication memory
@@ -145,7 +154,7 @@ def slack_events():
                             description,
                             user,
                             invoice_url,
-                            ocr_text or "No OCR text"
+                            ocr_text
                         ]
                     ]
                     try:
