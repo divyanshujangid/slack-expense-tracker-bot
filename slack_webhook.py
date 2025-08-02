@@ -130,7 +130,7 @@ def slack_events():
         for line in (lines or [""]):
             line = line.strip()
 
-            amount, currency, description = "", "", line or "No message"
+            amount, currency, description = extract_expense_info(line or "No message")
             ocr_text = ""
             invoice_url = ""
 
@@ -147,7 +147,8 @@ def slack_events():
                     file_content = r.content
                     invoice_url = upload_file_to_dropbox(file_content, fname)
 
-                    if not text:  # if no message text, extract from OCR
+                    # Run OCR only if message is missing or poor
+                    if not amount or not description or description.lower() in ["no message", ""]:
                         amount, currency, description, ocr_text = run_ocr_and_extract_info(file_content)
                     else:
                         ocr_text = "OCR skipped (text provided)"
