@@ -1,240 +1,169 @@
-from flask import Flask, request, jsonify
-from googleapiclient.discovery import build
-from google.oauth2 import service_account
-import dropbox
-import requests
-import datetime
 import os
-import base64
+import datetime
 import json
+import requests
 import re
-import tempfile
-import time
-import pytz
+from flask import Flask, request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from werkzeug.utils import secure_filename
 import pytesseract
 from PIL import Image
-from io import BytesIO
+import tempfile
 
 app = Flask(__name__)
 
-# === Environment Setup ===
-SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
-GOOGLE_CREDS_B64 = os.environ.get('GOOGLE_CREDS_B64')
-DROPBOX_ACCESS_TOKEN = os.environ.get('DROPBOX_ACCESS_TOKEN')
-SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
+DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload"
+DROPBOX_TOKEN = os.environ.get("DROPBOX_TOKEN")
 
-# === Google Sheets Setup ===
 def get_google_creds():
-    creds_info = json.loads(base64.b64decode(GOOGLE_CREDS_B64).decode('utf-8'))
-    return service_account.Credentials.from_service_account_info(
-        creds_info,
-        scopes=['https://www.googleapis.com/auth/spreadsheets']
-    )
+    creds_dict = json.loads(os.environ.get("GOOGLE_CREDS_JSON"))
+    return Credentials.from_authorized_user_info(creds_dict, SCOPES)
 
-creds = get_google_creds()
-sheets_service = build('sheets', 'v4', credentials=creds)
-sheet = sheets_service.spreadsheets()
+def get_month_sheet_name(timestamp):
+    return timestamp.strftime("%B")
 
-# === Helpers ===
-def extract_expense_info(line):
-    match = re.match(r'([₹$€£]?\s?[\d,]+(?:\.\d{1,2})?)\s*([A-Za-z$₹€£]*)\s*[-:]?\s*(.*)', line)
+def get_currency_and_amount(text):
+    match = re.search(r'([\₹$€£])\s?(\d+(?:[.,]\d{1,2})?)', text)
     if match:
-        amount = match.group(1).replace(',', '').replace(' ', '')
-        currency = match.group(2) if match.group(2) else ''
-        description = match.group(3).strip() or line
-    else:
-        amount, currency, description = '', '', line
-    if not currency and amount and amount[0] in '₹$€£':
-        currency, amount = amount[0], amount[1:]
-    if not currency:
-        currency = 'INR'
-    return amount.strip(), currency.strip(), description.strip()
+        symbol = match.group(1)
+        amount = match.group(2).replace(',', '')
+        currency_map = {
+            "$": "USD",
+            "₹": "INR",
+            "€": "EUR",
+            "£": "GBP"
+        }
+        currency = currency_map.get(symbol, "Not found")
+        return amount, currency
+    return "Not found", "Not found"
 
-def upload_file_to_dropbox(file_content, filename):
-    dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
-    unique_name = f"{int(time.time())}_{filename}"
-    dropbox_path = f"/{unique_name}"
+def extract_text_from_image(file_path):
     try:
-        dbx.files_upload(file_content, dropbox_path, mode=dropbox.files.WriteMode("add"))
-        try:
-            link = dbx.sharing_create_shared_link_with_settings(dropbox_path)
-            return link.url
-        except dropbox.exceptions.ApiError as e:
-            if hasattr(e.error, 'get_shared_link_already_exists') or 'shared_link_already_exists' in str(e):
-                links = dbx.sharing_list_shared_links(path=dropbox_path).links
-                if links:
-                    return links[0].url
-            print("Dropbox link creation failed:", e)
-            return None
-    except Exception as ex:
-        print("Dropbox upload failed:", ex)
+        return pytesseract.image_to_string(Image.open(file_path))
+    except Exception as e:
+        print("OCR failed:", e)
         return None
 
-def run_ocr_and_extract_info(content):
-    try:
-        image = Image.open(BytesIO(content)).convert("RGB")
-        text = pytesseract.image_to_string(image)
+def upload_to_dropbox(file_content, filename):
+    headers = {
+        "Authorization": f"Bearer {DROPBOX_TOKEN}",
+        "Dropbox-API-Arg": json.dumps({
+            "path": f"/{filename}",
+            "mode": "add",
+            "autorename": True,
+            "mute": False
+        }),
+        "Content-Type": "application/octet-stream"
+    }
+    response = requests.post(DROPBOX_UPLOAD_URL, headers=headers, data=file_content)
+    if response.status_code == 200:
+        metadata = response.json()
+        file_path = metadata["path_display"]
+        shared_link_resp = requests.post(
+            "https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings",
+            headers={
+                "Authorization": f"Bearer {DROPBOX_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            data=json.dumps({"path": file_path})
+        )
+        if shared_link_resp.ok:
+            url = shared_link_resp.json().get("url", "")
+            return url.replace("?dl=0", "?dl=1")
+    return None
 
-        amount_match = re.search(r'([₹$€£]?\s?\d{2,7}(?:\.\d{1,2})?)', text)
-        amount = amount_match.group(1).replace(' ', '') if amount_match else ""
+def append_to_google_sheet(row_data, sheet_name):
+    creds = get_google_creds()
+    service = build('sheets', 'v4', credentials=creds)
+    sheet = service.spreadsheets()
 
-        keywords = ["invoice", "payment", "amount", "bill", "total", "tax", "due", "receipt", "apple", "amazon"]
-        lines = text.splitlines()
-        desc_line = next((line for line in lines if any(k.lower() in line.lower() for k in keywords)), None)
+    # Ensure sheet tab exists
+    existing_sheets = sheet.get(spreadsheetId=SPREADSHEET_ID).execute()
+    sheet_titles = [s["properties"]["title"] for s in existing_sheets["sheets"]]
 
-        description = desc_line or "No description"
-        currency = amount[0] if amount and amount[0] in '₹$€£' else ''
-        if currency:
-            amount = amount[1:]
-
-        return amount.strip(), currency.strip(), description.strip(), text
-    except Exception as e:
-        print("[OCR ERROR]", e)
-        return "", "", "No description", ""
-
-def get_month_sheet_name(ts):
-    return datetime.datetime.strptime(ts, '%Y-%m-%d %H:%M:%S').strftime("%B")
-
-def ensure_month_sheet_exists(month_name):
-    try:
-        meta = sheets_service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-        existing_sheets = [s['properties']['title'] for s in meta['sheets']]
-        if month_name not in existing_sheets:
-            sheets_service.spreadsheets().batchUpdate(
-                spreadsheetId=SPREADSHEET_ID,
-                body={
-                    'requests': [{
-                        'addSheet': {
-                            'properties': {
-                                'title': month_name,
-                                'gridProperties': {'rowCount': 1000, 'columnCount': 10}
-                            }
+    if sheet_name not in sheet_titles:
+        sheet.batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={
+                "requests": [{
+                    "addSheet": {
+                        "properties": {
+                            "title": sheet_name
                         }
-                    }]
-                }
-            ).execute()
+                    }
+                }]
+            }
+        ).execute()
+        print(f"Created new sheet: {sheet_name}")
 
-            # Add header row
-            headers = [["Date", "Timestamp", "Amount", "Currency", "Description", "User", "Invoice URL", "OCR Text"]]
-            sheets_service.spreadsheets().values().append(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"{month_name}!A1",
-                valueInputOption='USER_ENTERED',
-                body={'values': headers}
-            ).execute()
-            print(f"Created new sheet: {month_name}")
-    except Exception as e:
-        print(f"[ERROR] Failed to ensure sheet {month_name} exists:", e)
+    # Append row
+    sheet.values().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet_name}!A1",
+        valueInputOption="RAW",
+        body={"values": [row_data]}
+    ).execute()
 
-# Deduplication memory
-processed_events = set()
-
-# === Routes ===
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
-    print("\n=== POST RECEIVED ===")
     data = request.json
+    print("=== POST RECEIVED ===")
     print(data)
 
-    if data.get("type") == "url_verification":
-        return jsonify({"challenge": data["challenge"]})
+    event = data.get("event", {})
+    user = event.get("user")
+    text = event.get("text", "")
+    files = event.get("files", [])
+    ts = float(event.get("ts", datetime.datetime.now().timestamp()))
+    timestamp = datetime.datetime.fromtimestamp(ts)
+    sheet_name = get_month_sheet_name(timestamp)
 
-    if data.get("event", {}).get("type") == "message":
-        event = data["event"]
-        event_id = event.get('client_msg_id') or event.get('ts') or event.get('event_ts')
-        if event_id in processed_events:
-            print(f"Duplicate event, skipping: {event_id}")
-            return "", 200
-        processed_events.add(event_id)
+    description = text.strip() if text else "No message"
+    amount, currency = get_currency_and_amount(description)
+    dropbox_url = ""
+    ocr_info = ""
 
-        text = event.get("text", "").strip()
-        user = event.get("user", "")
-        files = event.get("files", [])
-
-        tz = pytz.timezone('Asia/Kolkata')
-        timestamp = datetime.datetime.fromtimestamp(
-            float(event.get("ts", datetime.datetime.now().timestamp()))
-        ).astimezone(tz).strftime('%Y-%m-%d %H:%M:%S')
-
-        month_sheet = get_month_sheet_name(timestamp)
-        ensure_month_sheet_exists(month_sheet)
-
-        lines = text.splitlines() if text else []
-
-        for line in (lines or [""]):
-            line = line.strip()
-
-            amount, currency, description = "", "", line or "No message"
-            ocr_text = ""
-            invoice_url = ""
-
-            if files:
-                for file_obj in files:
-                    url = file_obj.get("url_private_download") or file_obj.get("url_private")
-                    fname = file_obj.get("name", "invoice")
-                    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
-                    r = requests.get(url, headers=headers)
-                    if r.status_code != 200:
-                        print("Failed to download file:", r.text)
-                        continue
-
-                    file_content = r.content
-                    invoice_url = upload_file_to_dropbox(file_content, fname)
-
-                    if not text:
-                        amount, currency, description, ocr_text = run_ocr_and_extract_info(file_content)
+    if files:
+        file_info = files[0]
+        file_url = file_info.get("url_private_download")
+        headers = {"Authorization": f"Bearer {os.environ.get('SLACK_BOT_TOKEN')}"}
+        file_response = requests.get(file_url, headers=headers)
+        if file_response.ok:
+            filename = f"{int(ts)}_{secure_filename(file_info['name'])}"
+            dropbox_url = upload_to_dropbox(file_response.content, filename)
+            if description == "No message":
+                with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                    tmp.write(file_response.content)
+                    tmp.flush()
+                    extracted = extract_text_from_image(tmp.name)
+                    if extracted:
+                        description = extracted.strip().split('\n')[0]
+                        amount, currency = get_currency_and_amount(extracted)
+                        ocr_info = "OCR used"
                     else:
-                        ocr_text = "OCR skipped (text provided)"
+                        ocr_info = "OCR failed"
+        else:
+            dropbox_url = "Download error"
 
-                    values = [[
-                        datetime.date.today().isoformat(),
-                        timestamp,
-                        amount or "Not found",
-                        currency or "INR",
-                        description or "No description",
-                        user,
-                        invoice_url,
-                        ocr_text or "No OCR text"
-                    ]]
-                    try:
-                        sheet.values().append(
-                            spreadsheetId=SPREADSHEET_ID,
-                            range=f"{month_sheet}",
-                            valueInputOption='USER_ENTERED',
-                            body={'values': values}
-                        ).execute()
-                        print(f"Row appended for file: {fname}")
-                    except Exception as e:
-                        print(f"Error appending row for file '{fname}': {e}")
-            else:
-                amount, currency, description = extract_expense_info(line)
-                values = [[
-                    datetime.date.today().isoformat(),
-                    timestamp,
-                    amount,
-                    currency or "INR",
-                    description,
-                    user,
-                    "",
-                    ""
-                ]]
-                try:
-                    sheet.values().append(
-                        spreadsheetId=SPREADSHEET_ID,
-                        range=f"{month_sheet}",
-                        valueInputOption='USER_ENTERED',
-                        body={'values': values}
-                    ).execute()
-                    print(f"Row appended for text only: {line}")
-                except Exception as e:
-                    print(f"Error appending row for '{line}': {e}")
+    else:
+        ocr_info = "OCR skipped (text provided)"
 
-    return "", 200
+    row_data = [
+        timestamp.strftime("%Y-%m-%d"),
+        timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        amount,
+        currency,
+        description,
+        user,
+        dropbox_url,
+        ocr_info
+    ]
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"}), 200
+    append_to_google_sheet(row_data, sheet_name)
+    return "OK"
 
 if __name__ == "__main__":
-    print(f"Using Google Sheet ID: {SPREADSHEET_ID}")
-    app.run(host="0.0.0.0", port=5000)
+    app.run(debug=True)
