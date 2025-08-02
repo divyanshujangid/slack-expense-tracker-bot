@@ -21,7 +21,6 @@ app = Flask(__name__)
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
 GOOGLE_CREDS_B64 = os.environ.get('GOOGLE_CREDS_B64')
 DROPBOX_ACCESS_TOKEN = os.environ.get('DROPBOX_ACCESS_TOKEN')
-RANGE = 'Expenses'
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 
 # === Google Sheets Setup ===
@@ -76,11 +75,9 @@ def run_ocr_and_extract_info(content):
         image = Image.open(BytesIO(content)).convert("RGB")
         text = pytesseract.image_to_string(image)
 
-        # Extract amount using regex
         amount_match = re.search(r'([₹$€£]?\s?\d{2,7}(?:\.\d{1,2})?)', text)
         amount = amount_match.group(1).replace(' ', '') if amount_match else ""
 
-        # Try to extract a likely description
         keywords = ["invoice", "payment", "amount", "bill", "total", "tax", "due", "receipt", "apple", "amazon"]
         lines = text.splitlines()
         desc_line = next((line for line in lines if any(k.lower() in line.lower() for k in keywords)), None)
@@ -94,6 +91,40 @@ def run_ocr_and_extract_info(content):
     except Exception as e:
         print("[OCR ERROR]", e)
         return "", "", "No description", ""
+
+def get_month_sheet_name(ts):
+    return datetime.datetime.strptime(ts, '%Y-%m-%d %H:%M:%S').strftime("%B")
+
+def ensure_month_sheet_exists(month_name):
+    try:
+        meta = sheets_service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+        existing_sheets = [s['properties']['title'] for s in meta['sheets']]
+        if month_name not in existing_sheets:
+            sheets_service.spreadsheets().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={
+                    'requests': [{
+                        'addSheet': {
+                            'properties': {
+                                'title': month_name,
+                                'gridProperties': {'rowCount': 1000, 'columnCount': 10}
+                            }
+                        }
+                    }]
+                }
+            ).execute()
+
+            # Add header row
+            headers = [["Date", "Timestamp", "Amount", "Currency", "Description", "User", "Invoice URL", "OCR Text"]]
+            sheets_service.spreadsheets().values().append(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{month_name}!A1",
+                valueInputOption='USER_ENTERED',
+                body={'values': headers}
+            ).execute()
+            print(f"Created new sheet: {month_name}")
+    except Exception as e:
+        print(f"[ERROR] Failed to ensure sheet {month_name} exists:", e)
 
 # Deduplication memory
 processed_events = set()
@@ -125,12 +156,15 @@ def slack_events():
             float(event.get("ts", datetime.datetime.now().timestamp()))
         ).astimezone(tz).strftime('%Y-%m-%d %H:%M:%S')
 
+        month_sheet = get_month_sheet_name(timestamp)
+        ensure_month_sheet_exists(month_sheet)
+
         lines = text.splitlines() if text else []
 
         for line in (lines or [""]):
             line = line.strip()
 
-            amount, currency, description = extract_expense_info(line or "No message")
+            amount, currency, description = "", "", line or "No message"
             ocr_text = ""
             invoice_url = ""
 
@@ -147,28 +181,25 @@ def slack_events():
                     file_content = r.content
                     invoice_url = upload_file_to_dropbox(file_content, fname)
 
-                    # Run OCR only if message is missing or poor
-                    if not amount or not description or description.lower() in ["no message", ""]:
+                    if not text:
                         amount, currency, description, ocr_text = run_ocr_and_extract_info(file_content)
                     else:
                         ocr_text = "OCR skipped (text provided)"
 
-                    values = [
-                        [
-                            datetime.date.today().isoformat(),
-                            timestamp,
-                            amount or "Not found",
-                            currency or "INR",
-                            description or "No description",
-                            user,
-                            invoice_url,
-                            ocr_text or "No OCR text"
-                        ]
-                    ]
+                    values = [[
+                        datetime.date.today().isoformat(),
+                        timestamp,
+                        amount or "Not found",
+                        currency or "INR",
+                        description or "No description",
+                        user,
+                        invoice_url,
+                        ocr_text or "No OCR text"
+                    ]]
                     try:
                         sheet.values().append(
                             spreadsheetId=SPREADSHEET_ID,
-                            range=RANGE,
+                            range=f"{month_sheet}",
                             valueInputOption='USER_ENTERED',
                             body={'values': values}
                         ).execute()
@@ -176,22 +207,21 @@ def slack_events():
                     except Exception as e:
                         print(f"Error appending row for file '{fname}': {e}")
             else:
-                values = [
-                    [
-                        datetime.date.today().isoformat(),
-                        timestamp,
-                        amount,
-                        currency or "INR",
-                        description,
-                        user,
-                        "",  # no file
-                        ""   # no OCR
-                    ]
-                ]
+                amount, currency, description = extract_expense_info(line)
+                values = [[
+                    datetime.date.today().isoformat(),
+                    timestamp,
+                    amount,
+                    currency or "INR",
+                    description,
+                    user,
+                    "",
+                    ""
+                ]]
                 try:
                     sheet.values().append(
                         spreadsheetId=SPREADSHEET_ID,
-                        range=RANGE,
+                        range=f"{month_sheet}",
                         valueInputOption='USER_ENTERED',
                         body={'values': values}
                     ).execute()
